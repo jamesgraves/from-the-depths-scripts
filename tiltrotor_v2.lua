@@ -1,9 +1,8 @@
 -- See comments at end.
 -- Tunable parameters.
-local max_v = 100 -- Max velocity.
+local max_v = 200 -- Max velocity.
 -- Should be set a little lower than what the aircraft is actually cable of.
 local max_t = 84  -- Maximum tilt for nacelles to use for forward thrust.
-local thrustMP = (max_v / 45) * 1.5
 local max_alt_error = 10 -- Artifically increase / decrease velocity by
 -- up to this much to back off the thrust angle a little.
 local pitchAngleCompensation = 0.1 -- Differential tilt of fore/aft nacelles
@@ -16,7 +15,6 @@ local altMP = 6 -- hydro angle multiplier to get desired altitude
 local max_yaw = 20 -- Max angle offset for yaw, don't set this so high
 -- you are losing altitude while turning.
 
-local vehicleName = "tiltrotor"
 -- This is the approximate distance from the dediblade block to the
 -- spinblock in meters.  Dediblades found within this distance of a
 -- spinblock are assumed to be part of that nacelle.
@@ -47,12 +45,12 @@ end
 local RollPID     = NewPID(0.4, 0.0100, 0.08, 180.0, -180.0,   1.0,   -1.0)
 local PitchPID    = NewPID(0.4, 0.0100, 0.08, 180.0, -180.0,   1.0,   -1.0)
 local ALTPID      = NewPID(0.2, 0.0010, 0.12,   1.0, -1.0,     1.0,   -0.5)
-local FWThrustPID = NewPID(1.0, 0.01,   0.01, max_v,  0.0,     0.0,   -1*max_t)
+local FWThrustPID = NewPID(1.0, 0.01,   0.01, max_v, -1*max_v, max_t, -1*max_t)
 
 -- not currently used.
 local YawPID      = NewPID(0.5, 0.01,   0.01,   1.0, -1.0,     1.0,   -1)
 
--- Internal variables.  Don't modify these.
+-- Internal variables.
 local dt = 0.025 -- 25mS == 40Hz game tick.
 
 -- Maps the names of the manual control hydrofoils to component indexes.
@@ -63,8 +61,9 @@ local manual_controls_valid = false
 -- (bow/stern, port/starboard) depending upon placement on the vehicle.
 local tiltrotor_list   = {}
 local last_spinner_count = 0
-
 local tick_counter = 0
+local target_altitude = 50
+local target_thrust = 0
 
 --------------------------- Program Code -------------------------------
 -- Check all regular and dediblade spinblocks on the vehicle.
@@ -163,43 +162,6 @@ function Check_Spinners(I)
 end -- Check_Spinners()
 
 
--- Hardcoded for 3 manual controls (see above).
-function Check_Manual_Controls(I)
-    if I:Component_GetCount(8) == 3 then
-        if manual_controls_valid then
-            return
-        else
-            -- Scan for and assign manual control hydrofoils based on
-            -- the location on the vehicle.
-            local max_x = -10000000
-            local min_x =  10000000
-            for c = 0, 2 do
-                local hf_info = I:Component_GetBlockInfo(8, c)
-                max_x = math.max(max_x, hf_info.LocalPosition.x)
-                min_x = math.min(min_x, hf_info.LocalPosition.x)
-            end
-            for c = 0, 2 do
-                local hf_info = I:Component_GetBlockInfo(8, c)
-                if hf_info.LocalPosition.x == min_x then
-                    manual_controls.altitude_set_point = c
-                elseif hf_info.LocalPosition.x == max_x then
-                    manual_controls.yaw_request = c
-                else
-                    manual_controls.forward_thrust_set_point = c
-                end
-            end
-            I:Log("manual controls OK")
-            manual_controls_valid = true
-        end
-    else
-        I:Log("manual controls invalid")
-        manual_controls_valid = false
-        -- Can't do anything else at this point until
-        -- the controls have been repaired.
-    end
-end
-
-
 function PIDcal(SetPoint,ProcessVariable,PID)
    -- P
    local err = SetPoint - ProcessVariable
@@ -281,31 +243,6 @@ function MixAndSetTiltrotors(I, thrust_angle, yaw_angle, outputPitch)
     end
 end
 
-
-function GetManualAltInput(I)
-    return (I:Component_GetFloatLogic(8, manual_controls.altitude_set_point) + 45) * altMP
-end
-
-function GetManualThrustInput(I)
-    return (I:Component_GetFloatLogic(8, manual_controls.forward_thrust_set_point)) * thrustMP
-end
-
-function GetManualYawInput(I)
-    local curr_hydro_angle = I:Component_GetFloatLogic(8, manual_controls.yaw_request)
-    if curr_hydro_angle >= 0.9 then
-        curr_hydro_angle = curr_hydro_angle - 0.9
-        I:Component_SetFloatLogic(8, manual_controls.yaw_request, curr_hydro_angle)
-        return 1
-    elseif curr_hydro_angle <= -0.9 then
-        curr_hydro_angle = curr_hydro_angle + 0.9
-        I:Component_SetFloatLogic(8, manual_controls.yaw_request, curr_hydro_angle)
-        return -1
-    else
-        I:Component_SetFloatLogic(8, manual_controls.yaw_request, 0)
-        return 0
-    end
-end
-
 function Shutdown(I)
     for i, tiltrotor in ipairs(tiltrotor_list) do
         if tiltrotor.down_dediblade > -1 then
@@ -325,67 +262,68 @@ function Update(I)
         return
     end
 
-    Check_Manual_Controls(I)
     Check_Spinners(I)
     local pos = I:GetConstructPosition()
 
     -- tick pids
     -- local alt_target = AvoidTerrain(I, pos) + GetManualAltInput(I)
-    local alt_target = GetManualAltInput(I)
+    if I:GetInput(0,5) == 1 then
+        target_altitude = target_altitude + 1
+    elseif I:GetInput(0,4) == 1 then
+        target_altitude = target_altitude - 1
+    end
     local curr_altitude = pos.y
-    local alt_error = math.max(alt_target - curr_altitude, 10)
+    local alt_error = math.max(target_altitude - curr_altitude, 10)
     if alt_error > 0 then
         alt_error = math.min(alt_error, max_alt_error)
     else
         alt_error = math.max(alt_error, -1 * max_alt_error)
     end
-    outputAlt,ALTPID = PIDcal(alt_target, curr_altitude, ALTPID)
+    outputAlt,ALTPID = PIDcal(target_altitude, curr_altitude, ALTPID)
 
     local pitch = I:GetConstructPitch()
-    if pitch > 180 then pitch = -360 + pitch end -- set pitch range to +/- 180 degrees
+    if pitch > 180 then pitch = -360 + pitch end -- normalize pitch range
     outputPitch, PitchPID = PIDcal(0, pitch, PitchPID)
 
     local roll = I:GetConstructRoll()
-    if roll > 180 then roll = -360 + roll end    -- set roll range to +/- 180 degrees
+    if roll > 180 then roll = -360 + roll end    -- normalize roll range
     outputRoll,RollPID = PIDcal(0,roll,RollPID)
 
     -- yaw
-    local yaw_request = GetManualYawInput(I)
+    local yaw_request = 0
+    if I:GetInput(0,0) == 1 then
+        yaw_request = -1
+    elseif I:GetInput(0,1) == 1 then
+        yaw_request = 1
+    end
     local outputYawAngle = max_yaw  * yaw_request
 
     -- forward thrust
-    local thrust_target = GetManualThrustInput(I)
+    target_thrust = I:GetDrive(0) * 200
     local fw_velocity = I:GetForwardsVelocityMagnitude()
     local outputThrustAngle = 0
 
-    if (thrust_target <= thrustMP and thrust_target >= -1 * thrustMP) then
-        outputThrustAngle = 0 -- dead zone
-    else
-        if curr_altitude < alt_target then
-            -- Exaggerate the velocity by the altitude error.
-            if thrust_target > 0 and fw_velocity > 0 then
-                fw_velocity = fw_velocity + alt_error
-            elseif thrust_target < 0 and fw_velocity < 0 then
-                fw_velocity = fw_velocity - alt_error
-            end
+    if curr_altitude < target_altitude then
+        -- Exaggerate the velocity by the altitude error.
+        if target_thrust > 0 and fw_velocity > 0 then
+            fw_velocity = fw_velocity + alt_error
+        elseif target_thrust < 0 and fw_velocity < 0 then
+            fw_velocity = fw_velocity - alt_error
         end
-        -- thrust_target is signed
-        outputThrustAngle, FWThrustPID = PIDcal(math.abs(thrust_target), math.abs(fw_velocity), FWThrustPID)
-        if thrust_target < 0 then
-            outputThrustAngle = outputThrustAngle * -1
-        end
+    end
+    -- target_thrust is signed
+    outputThrustAngle, FWThrustPID = PIDcal(target_thrust, fw_velocity, FWThrustPID)
+    tick_counter = tick_counter + 1
+    if tick_counter % 160 == 0 then
+        I:LogToHud(string.format("velocity  %.1f  thrust angle %.1f",
+            fw_velocity, outputThrustAngle))
+        tick_counter = 0
     end
 
     -- send commands
     MixAndSetDediblades(I, outputRoll, outputPitch, outputAlt)
     MixAndSetTiltrotors(I, outputThrustAngle, outputYawAngle, outputPitch)
 
-    tick_counter = tick_counter + 1
-    if tick_counter % 40 == 0 then
-        I:LogToHud(string.format("tt %.0f  vel + err %.1f  OTA %.1f   OYA %.1f   tar alt %d",
-            thrust_target, fw_velocity, outputThrustAngle, outputYawAngle, alt_target))
-        tick_counter = 0
-    end
 end
 
 --[[ x
