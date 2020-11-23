@@ -10,10 +10,9 @@ local pitchAngleCompensation = 0.1 -- Differential tilt of fore/aft nacelles
 -- foward speeds.  It is always safe to set this to 0.0 if you are
 -- seeing pitch oscillations first, and if you are still having
 -- problems, adjust the PID.
-local altMP = 6 -- hydro angle multiplier to get desired altitude
 
-local max_yaw = 20 -- Max angle offset for yaw, don't set this so high
--- you are losing altitude while turning.
+local max_yaw = 30 -- Max angle offset for yaw, don't set this so high
+-- you are losing a lot of altitude while turning.
 
 -- This is the approximate distance from the dediblade block to the
 -- spinblock in meters.  Dediblades found within this distance of a
@@ -44,18 +43,13 @@ end
 --          set PIDs      (  P,   I,     D,   IMax,  IMin,    OutMax, OutMin)
 local RollPID     = NewPID(0.4, 0.0100, 0.08, 180.0, -180.0,   1.0,   -1.0)
 local PitchPID    = NewPID(0.4, 0.0100, 0.08, 180.0, -180.0,   1.0,   -1.0)
-local ALTPID      = NewPID(0.2, 0.0010, 0.12,   1.0, -1.0,     1.0,   -0.5)
-local FWThrustPID = NewPID(1.0, 0.01,   0.01, max_v, -1*max_v, max_t, -1*max_t)
-
--- not currently used.
-local YawPID      = NewPID(0.5, 0.01,   0.01,   1.0, -1.0,     1.0,   -1)
+local AltThrPID   = NewPID(0.2, 0.0010, 0.12,   1.0, -1.0,     1.0,   -0.5)
+-- local AltAngPID   = NewPID(0.4, 0.0100, 0.08,  50.0, -50.0,    1.0,   -1.0)
+-- AltAngPID adjusts the tilt of the nacelles based on the altitude error
+-- due to foward thrust.
 
 -- Internal variables.
 local dt = 0.025 -- 25mS == 40Hz game tick.
-
--- Maps the names of the manual control hydrofoils to component indexes.
-local manual_controls = {}
-local manual_controls_valid = false
 
 -- Tiltrotor assemblies may be in up to two groups
 -- (bow/stern, port/starboard) depending upon placement on the vehicle.
@@ -63,7 +57,6 @@ local tiltrotor_list   = {}
 local last_spinner_count = 0
 local tick_counter = 0
 local target_altitude = 50
-local target_thrust = 0
 
 --------------------------- Program Code -------------------------------
 -- Check all regular and dediblade spinblocks on the vehicle.
@@ -210,11 +203,11 @@ function MixAndSetDediblades(I, roll_thr, pitch_thr, alt_thr)
    end
 end
 
--- Set angle for tiltrotor nacelles.
-function MixAndSetTiltrotors(I, thrust_angle, yaw_angle, outputPitch)
+-- Set angle for all tiltrotor nacelles.
+function MixAndSetNacelles(I, thrust_angle, yaw_angle, outputPitch)
     -- The problem with the pitch angle compensation is that the
-    -- effect is highly non-linear.  It makes a big difference at high (close to 90)
-    -- tiltrotor angles, but has little effect at modest angles.
+    -- effect is highly non-linear.  It makes a big difference at high
+    -- (close to 90) tiltrotor angles, but has little effect at modest angles.
     local pitch_compensation = outputPitch * pitchAngleCompensation
     for i, tiltrotor in ipairs(tiltrotor_list) do
         local angle = -1 * yaw_angle
@@ -233,7 +226,8 @@ function MixAndSetTiltrotors(I, thrust_angle, yaw_angle, outputPitch)
                 angle = angle - pitch_compensation
             end
         end
-        -- Ensure that even with pitch compensation and yaw that we don't exceed max tilt.
+        -- Ensure that even with pitch compensation and yaw that we
+        -- don't exceed max tilt.
         if angle < -1 * max_t then
             angle = -1 * max_t
         elseif angle > max_t then
@@ -279,7 +273,8 @@ function Update(I)
     else
         alt_error = math.max(alt_error, -1 * max_alt_error)
     end
-    outputAlt,ALTPID = PIDcal(target_altitude, curr_altitude, ALTPID)
+    local throttle = 0.0
+    throttle, AltThrPID = PIDcal(target_altitude, curr_altitude, AltThrPID)
 
     local pitch = I:GetConstructPitch()
     if pitch > 180 then pitch = -360 + pitch end -- normalize pitch range
@@ -287,7 +282,7 @@ function Update(I)
 
     local roll = I:GetConstructRoll()
     if roll > 180 then roll = -360 + roll end    -- normalize roll range
-    outputRoll,RollPID = PIDcal(0,roll,RollPID)
+    outputRoll, RollPID = PIDcal(0,roll,RollPID)
 
     -- yaw
     local yaw_request = 0
@@ -298,31 +293,23 @@ function Update(I)
     end
     local outputYawAngle = max_yaw  * yaw_request
 
-    -- forward thrust
-    target_thrust = I:GetDrive(0) * 200
-    local fw_velocity = I:GetForwardsVelocityMagnitude()
-    local outputThrustAngle = 0
+    -- forward thrust: drive plus tilt
+    local nacelle_angle = I:GetDrive(0) * 90.0
+    local altitude_error = curr_altitude - target_altitude
+    if altitude_error > 0.0 then altitude_error = 0.0 end
+    if altitude_error < -50.0 then altitude_error = -50.0 end
+    nacelle_angle = nacelle_angle * ( 1.0 + (altitude_error / 100.0))
 
-    if curr_altitude < target_altitude then
-        -- Exaggerate the velocity by the altitude error.
-        if target_thrust > 0 and fw_velocity > 0 then
-            fw_velocity = fw_velocity + alt_error
-        elseif target_thrust < 0 and fw_velocity < 0 then
-            fw_velocity = fw_velocity - alt_error
-        end
-    end
-    -- target_thrust is signed
-    outputThrustAngle, FWThrustPID = PIDcal(target_thrust, fw_velocity, FWThrustPID)
     tick_counter = tick_counter + 1
     if tick_counter % 160 == 0 then
-        I:LogToHud(string.format("velocity  %.1f  thrust angle %.1f",
-            fw_velocity, outputThrustAngle))
+        I:LogToHud(string.format("alt error (m) %.1f  nacelle angle %.1f",
+            altitude_error, nacelle_angle))
         tick_counter = 0
     end
 
     -- send commands
-    MixAndSetDediblades(I, outputRoll, outputPitch, outputAlt)
-    MixAndSetTiltrotors(I, outputThrustAngle, outputYawAngle, outputPitch)
+    MixAndSetDediblades(I, outputRoll, outputPitch, throttle)
+    MixAndSetNacelles(I, nacelle_angle, outputYawAngle, outputPitch)
 
 end
 
@@ -364,22 +351,8 @@ Forward thrust control input from user is just mapped to forward tilt angle.
 So forward speed is just whatever you get from that tilt angle, it is
 not something actively controlled for.
 
-Don't bother with reverse, how often do you need that anyway, use the
-additional range for forward tilt control.
-
 Zero requested altitude and zero requested tilt will turn off the
 dediblades, so the craft can rest on the water without using power.
-
-Use non-linear mapping for forward tilt, to increase precision at top
-speed. Not worried about going 10 m/s vs. 20 m/s.
-
-Nominal hydro angle is -45 to +45 degrees.
-
-    -45 to -40 degrees:  tilt = 0
-    -40 to -25 degrees:  tilt = (hydro + 40) * 2 +  5   ( 5 to 35)
-    -25 to 10  degrees:  tilt = (hydro + 25) * 1 + 35   (35 to 70)
-    10  to 30  degrees:  tilt = (hydro - 10) / 2 + 70   (70 to 80)
-    30  to 45  degrees:  tilt = (hydro - 30) / 3 + 80   (80 to 85)
 
 When the nacelles are at a high angle, that obviously reduces downward
 thrust considerably (the craft nominally does not have wings that provide
@@ -400,23 +373,6 @@ Adjust base dediblade power to control altitude.
 
 --]]
 
---[[
-
-Requirements:
-
-Complex controller block.
-
-Manual controls require 3 hydrofoils.
-These should all be in a row, and from left to right are:
-
-1. Altitude Setpoint (-45 degrees is 0 altitude, +45 degrees is max)
-2. Forward Thrust Setpoint (-45 is 0 m/s, and +45 is max tilt forward,
-   non-linear).
-3. Yaw. (negative degrees yaw the vehicle to the left, positive to the
-   right, yaw rate proportional angle TBD).
-   Note that without continual user input, this will reset to 0 degrees.
-
---]]
 
 --[[
 
