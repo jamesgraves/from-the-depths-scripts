@@ -41,12 +41,10 @@ function NewPID(Kp,Ki,Kd,IMax,IMin,OutMax,OutMin)
 end
 
 --          set PIDs      (  P,   I,     D,   IMax,  IMin,    OutMax, OutMin)
-local RollPID     = NewPID(0.4, 0.0100, 0.08, 180.0, -180.0,   1.0,   -1.0)
+local RollPID     = NewPID(0.1, 0.0100, 0.05, 180.0, -180.0,   1.0,   -1.0)
 local PitchPID    = NewPID(0.4, 0.0100, 0.08, 180.0, -180.0,   1.0,   -1.0)
-local AltThrPID   = NewPID(0.2, 0.0010, 0.12,   1.0, -1.0,     1.0,   -0.5)
--- local AltAngPID   = NewPID(0.4, 0.0100, 0.08,  50.0, -50.0,    1.0,   -1.0)
--- AltAngPID adjusts the tilt of the nacelles based on the altitude error
--- due to foward thrust.
+local AltThrPID   = NewPID(0.2, 0.0010, 0.12,   1.0, -1.0,     2.0,   -0.5)
+local YawPID      = NewPID(0.1, 0.0100, 0.05, 180.0, -180.0,   1.0,   -1.0)
 
 -- Internal variables.
 local dt = 0.025 -- 25mS == 40Hz game tick.
@@ -57,6 +55,14 @@ local tiltrotor_list   = {}
 local last_spinner_count = 0
 local tick_counter = 0
 local target_altitude = 50
+local target_heading = 0.0
+local turning = false
+
+function normalize_heading(heading)
+    if heading > 360  then heading = heading - 360 end
+    if heading < -360 then heading = heading + 360 end
+    return heading
+end
 
 --------------------------- Program Code -------------------------------
 -- Check all regular and dediblade spinblocks on the vehicle.
@@ -64,6 +70,7 @@ local target_altitude = 50
 function Check_Spinners(I)
     local spinners = I:GetSpinnerCount()
     if spinners == last_spinner_count then return end
+    target_heading = I:GetConstructYaw() -- maintain current heading
     I:ClearLogs()
     I:Log(string.format("old spinners %d  new spinners %d",
                         last_spinner_count, spinners))
@@ -257,15 +264,16 @@ function Update(I)
     end
 
     Check_Spinners(I)
-    local pos = I:GetConstructPosition()
 
-    -- tick pids
     -- local alt_target = AvoidTerrain(I, pos) + GetManualAltInput(I)
-    if I:GetInput(0,5) == 1 then
+
+    -- altitude
+    if I:GetInput(0,4) == 1 then
         target_altitude = target_altitude + 1
-    elseif I:GetInput(0,4) == 1 then
+    elseif I:GetInput(0,5) == 1 then
         target_altitude = target_altitude - 1
     end
+    local pos = I:GetConstructPosition()
     local curr_altitude = pos.y
     local alt_error = math.max(target_altitude - curr_altitude, 10)
     if alt_error > 0 then
@@ -274,46 +282,65 @@ function Update(I)
         alt_error = math.max(alt_error, -1 * max_alt_error)
     end
     local throttle = 0.0
+    local tilt_reduction = 0.0
     throttle, AltThrPID = PIDcal(target_altitude, curr_altitude, AltThrPID)
+    if throttle > 1.0 then
+        tilt_reduction = throttle - 1.0
+        throttle = 1.0
+    end
 
+    -- Pitch & Roll Stabilization
     local pitch = I:GetConstructPitch()
-    if pitch > 180 then pitch = -360 + pitch end -- normalize pitch range
+    if pitch > 180 then pitch = pitch - 360 end -- normalize pitch range
     outputPitch, PitchPID = PIDcal(0, pitch, PitchPID)
 
     local roll = I:GetConstructRoll()
-    if roll > 180 then roll = -360 + roll end    -- normalize roll range
-    outputRoll, RollPID = PIDcal(0,roll,RollPID)
+    if roll > 180 then roll = roll - 360 end    -- normalize roll range
+    local outputRollYaw = 0.0
+    outputRollYaw, RollPID = PIDcal(0,roll,RollPID)
+
+    -- forward / backward thrust level
+    local nacelle_angle = I:GetDrive(0) * 90.0
+    nacelle_angle = nacelle_angle * (1.0 - tilt_reduction)
 
     -- yaw
-    local yaw_request = 0
+    local heading = I:GetConstructYaw()
     if I:GetInput(0,0) == 1 then
-        yaw_request = -1
+        target_heading = normalize_heading(target_heading - 0.5)
+        turning = true
     elseif I:GetInput(0,1) == 1 then
-        yaw_request = 1
+        target_heading = normalize_heading(target_heading + 0.5)
+        turning = true
+    elseif turning == true then
+        turning = false
+        target_heading = heading -- snap to the heading when the user lets go the key
     end
-    local outputYawAngle = max_yaw  * yaw_request
+    local heading_diff = heading - target_heading
+    if heading_diff < -180 then heading_diff = heading_diff + 360 end
+    if heading_diff >  180 then heading_diff = heading_diff - 360 end
+    local outputYaw, YawPID = PIDcal(0, heading_diff, YawPID)
+    local differentialYawAngle = outputYaw * max_yaw
 
-    -- forward thrust: drive plus tilt
-    local nacelle_angle = I:GetDrive(0) * 90.0
-    local altitude_error = curr_altitude - target_altitude
-    if altitude_error > 0.0 then altitude_error = 0.0 end
-    if altitude_error < -50.0 then altitude_error = -50.0 end
-    nacelle_angle = nacelle_angle * ( 1.0 + (altitude_error / 100.0))
+    if I:GetDrive(0) == 0 and target_altitude < 0.0 then
+        throttle = 0.0
+    end
 
     tick_counter = tick_counter + 1
     if tick_counter % 160 == 0 then
-        I:LogToHud(string.format("alt error (m) %.1f  nacelle angle %.1f",
-            altitude_error, nacelle_angle))
+        I:LogToHud(string.format("heading   %.1f  target heading %.1f", heading, target_heading))
+        I:LogToHud(string.format("heading diff   %.1f  outputYaw %.1f", heading_diff, outputYaw))
         tick_counter = 0
     end
 
+
+
     -- send commands
-    MixAndSetDediblades(I, outputRoll, outputPitch, throttle)
-    MixAndSetNacelles(I, nacelle_angle, outputYawAngle, outputPitch)
+    MixAndSetDediblades(I, outputRollYaw, outputPitch, throttle)
+    MixAndSetNacelles(I, nacelle_angle, differentialYawAngle, outputPitch)
 
 end
 
---[[ x
+--[[
 
 Tiltrotor AI.
 
@@ -389,5 +416,21 @@ View from front of vehicle:
     d is a dediblade
     - is a blade block
     = are 4m beams
+
+Settings:
+    Spinner Data Tab:
+        Continuous
+        Motor Drive:                10
+        Upwards Force Fraction:      0
+        Advanced Controller Insta-spin factor: 0
+    Spin rate control Tab:
+        Traditional Movement:
+            Forward/Backward:       off
+            Yaw:                    off
+            Pitch:                  off
+            Roll:                   off
+        Drive Factors
+            Main Positive:           0
+
 --]]
 
