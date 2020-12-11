@@ -1,4 +1,4 @@
--- Tiltrotor without yaw control.  See comments at end.
+-- Tiltrotor without yaw control.  See comments and credits at end.
 
 -- Tunable parameters.
 
@@ -45,6 +45,7 @@ local target_altitude = 50
 local target_heading = 0.0
 local turning = false
 local altitude_change = false
+local excessive_vehicle_tilt = false
 
 --------------------------- Program Code -------------------------------
 
@@ -56,6 +57,25 @@ local min=math.min
 function Check_Spinners(I)
     local spinners = I:GetSpinnerCount()
     if spinners == last_spinner_count then return end
+
+    -- Initialization won't work if the vehicle is not close to level.
+    local pitch
+    local roll
+    pitch = I:GetConstructPitch()
+    roll = I:GetConstructRoll()
+    if roll > 180 then roll = roll - 360 end    -- normalize roll range
+    if pitch > 180 then pitch = pitch - 360 end -- normalize pitch range
+    if pitch < -44 or pitch > 44 or roll < -44 or roll > 44 then
+        if not excessive_vehicle_tilt then
+            excessive_vehicle_tilt = true
+            I:Log("Excessive vehicle pitch / roll detected.")
+            I:Log("Spinners NOT re-initialized.")
+            I:Log("Restart Lua block to force re-initialization.")
+        end
+        return
+    end
+    excessive_vehicle_tilt = false
+
     I:ClearLogs()
     I:Log(string.format("old spinners %d  new spinners %d",
                         last_spinner_count, spinners))
@@ -406,6 +426,8 @@ To be added:
 This code is inspired by CP75's sigma delta stabilization code:
 http://www.fromthedepthsgame.com/forum/showthread.php?tid=10680&page=3
 But has been almost completely re-written.
+
+Thanks also to reddit.com/u/wrigh516 for sharing his tiltrotor AI code.
 
 --]]
 
